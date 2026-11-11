@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import gsap from "gsap";
 import API from "../services/api";
+
 import {
   CheckCircle,
   AlertCircle,
@@ -20,10 +21,95 @@ import {
   Loader2,
 } from "lucide-react";
 
+// ========================================
+// IMAGE OPTIMIZATION
+// ========================================
+
+const compressImage = async (file) => {
+  try {
+    const bitmap = await createImageBitmap(file);
+
+    const maxSize = 1024;
+
+    const scale = Math.min(
+      1,
+      maxSize / Math.max(bitmap.width, bitmap.height)
+    );
+
+    const canvas = document.createElement("canvas");
+
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+
+    const ctx = canvas.getContext("2d");
+
+    if (!ctx) {
+      bitmap.close();
+      return file;
+    }
+
+    ctx.drawImage(
+      bitmap,
+      0,
+      0,
+      canvas.width,
+      canvas.height
+    );
+
+    bitmap.close();
+
+    const blob = await new Promise((resolve) => {
+      canvas.toBlob(
+        resolve,
+        "image/jpeg",
+        0.78
+      );
+    });
+
+    if (!blob) return file;
+
+    return new File(
+      [blob],
+      "item-image.jpg",
+      {
+        type: "image/jpeg",
+        lastModified: Date.now(),
+      }
+    );
+  } catch (error) {
+    console.warn(
+      "Image compression skipped:",
+      error.message
+    );
+
+    return file;
+  }
+};
+
+const readFileAsDataURL = (file) => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onload = () => resolve(reader.result);
+
+    reader.onerror = () => {
+      reject(new Error("Unable to read image."));
+    };
+
+    reader.readAsDataURL(file);
+  });
+};
+
+// ========================================
+// REPORT ITEM COMPONENT
+// ========================================
+
 function ReportItem() {
   const navigate = useNavigate();
+
   const formRef = useRef(null);
   const cardRef = useRef(null);
+  const scanRequestRef = useRef(0);
 
   const [formData, setFormData] = useState({
     title: "",
@@ -39,7 +125,10 @@ function ReportItem() {
   const [submitting, setSubmitting] = useState(false);
   const [scanningImage, setScanningImage] = useState(false);
 
-  // GSAP entrance animations
+  // ========================================
+  // GSAP ENTRANCE ANIMATIONS
+  // ========================================
+
   useEffect(() => {
     const ctx = gsap.context(() => {
       gsap.fromTo(
@@ -78,52 +167,112 @@ function ReportItem() {
     return () => ctx.revert();
   }, []);
 
+  // ========================================
+  // FORM INPUT HANDLER
+  // ========================================
+
   const handleChange = (e) => {
     const { name, value } = e.target;
-    setFormData((prev) => ({ ...prev, [name]: value }));
+
+    setFormData((prev) => ({
+      ...prev,
+      [name]: value,
+    }));
   };
 
-  // Image selection and AI auto-fill
+  // ========================================
+  // IMAGE SCAN AND AUTO-FILL
+  // ========================================
+
   const handleFileChange = async (e) => {
-    const file = e.target.files && e.target.files[0];
+    const input = e.target;
+    const file = input.files?.[0];
+
     if (!file) return;
 
+    if (!file.type.startsWith("image/")) {
+      alert("Please select a valid image.");
+      input.value = "";
+      return;
+    }
+
+    // Store original file for actual report upload.
     setImageFile(file);
 
-    const reader = new FileReader();
-    reader.readAsDataURL(file);
+    // Track latest scan to prevent old requests
+    // from overwriting a newly selected image.
+    const currentScan = ++scanRequestRef.current;
 
-    reader.onloadend = async () => {
-      const base64Image = reader.result;
-      setScanningImage(true);
+    setScanningImage(true);
 
-      try {
-        const res = await API.post("/ai/analyze-image", {
+    try {
+      // Compress image before sending to Gemini.
+      const optimizedImage = await compressImage(file);
+
+      const base64Image = await readFileAsDataURL(
+        optimizedImage
+      );
+
+      const response = await API.post(
+        "/ai/analyze-image",
+        {
           imageBase64: base64Image,
-          mimeType: file.type || "image/jpeg",
-        });
-
-        if (res.data?.success && res.data?.analysis) {
-          const { title, category, description } = res.data.analysis;
-
-          setFormData((prev) => ({
-            ...prev,
-            title: title || prev.title,
-            category: category || prev.category,
-            description: description || prev.description,
-          }));
+          mimeType: optimizedImage.type || "image/jpeg",
         }
-      } catch (err) {
-        console.error("Image AI Scan Error:", err);
-      } finally {
+      );
+
+      // Ignore older scan responses.
+      if (currentScan !== scanRequestRef.current) {
+        return;
+      }
+
+      if (
+        response.data?.success &&
+        response.data?.analysis &&
+        !response.data?.fallback
+      ) {
+        const {
+          title,
+          category,
+          description,
+        } = response.data.analysis;
+
+        setFormData((prev) => ({
+          ...prev,
+          title: title || prev.title,
+          category: category || prev.category,
+          description: description || prev.description,
+        }));
+      } else {
+        console.warn(
+          "AI scan unavailable. Manual entry is available."
+        );
+      }
+    } catch (error) {
+      if (currentScan === scanRequestRef.current) {
+        console.error(
+          "Image AI Scan Error:",
+          error.response?.data || error.message
+        );
+      }
+    } finally {
+      if (currentScan === scanRequestRef.current) {
         setScanningImage(false);
       }
-    };
+
+      input.value = "";
+    }
   };
 
-  // Form submission
+  // ========================================
+  // REPORT SUBMISSION
+  // ========================================
+
   const handleSubmit = async (e) => {
     e.preventDefault();
+
+    if (submitting) return;
+
     setSubmitting(true);
 
     try {
@@ -131,40 +280,77 @@ function ReportItem() {
 
       if (!token) {
         alert("Please login first to submit a report!");
-        setSubmitting(false);
+
         navigate("/login");
         return;
       }
 
       const submissionData = new FormData();
 
-      submissionData.append("title", formData.title);
-      submissionData.append("category", formData.category);
+      submissionData.append(
+        "title",
+        formData.title.trim()
+      );
+
+      submissionData.append(
+        "category",
+        formData.category
+      );
+
       submissionData.append(
         "date",
         formData.date || new Date().toISOString()
       );
-      submissionData.append("location", formData.location);
-      submissionData.append("contactInfo", formData.contactInfo);
-      submissionData.append("description", formData.description);
-      submissionData.append("type", formData.type);
+
+      submissionData.append(
+        "location",
+        formData.location.trim()
+      );
+
+      submissionData.append(
+        "contactInfo",
+        formData.contactInfo.trim()
+      );
+
+      submissionData.append(
+        "description",
+        formData.description.trim()
+      );
+
+      submissionData.append(
+        "type",
+        formData.type
+      );
 
       if (imageFile) {
         submissionData.append("image", imageFile);
       }
 
-      const response = await API.post("/items", submissionData, {
-        headers: { "Content-Type": "multipart/form-data" },
-      });
-
-      const newItemId = response.data?.item?._id || response.data?._id;
-
-      if (newItemId) {
-        try {
-          await API.post("/ai/match", { itemId: newItemId });
-        } catch (aiErr) {
-          console.warn("AI match background process skipped:", aiErr);
+      const response = await API.post(
+        "/items",
+        submissionData,
+        {
+          headers: {
+            "Content-Type": "multipart/form-data",
+          },
         }
+      );
+
+      const newItemId =
+        response.data?.item?._id ||
+        response.data?._id;
+
+      // Start matching independently.
+      // Do not wait for matching before navigating.
+      if (newItemId) {
+        API.post("/ai/match", {
+          itemId: newItemId,
+        }).catch((error) => {
+          console.warn(
+            "Background matching failed:",
+            error.message
+          );
+        });
       }
 
       alert(
@@ -172,18 +358,28 @@ function ReportItem() {
       );
 
       navigate(
-        formData.type === "found" ? "/found-items" : "/lost-items"
+        formData.type === "found"
+          ? "/found-items"
+          : "/lost-items"
       );
-    } catch (err) {
-      console.error("Submission error:", err);
+    } catch (error) {
+      console.error(
+        "Submission error:",
+        error.response?.data || error.message
+      );
+
       alert(
-        err.response?.data?.message ||
-          "Error submitting report. Please try again."
+        error.response?.data?.message ||
+        "Error submitting report. Please try again."
       );
     } finally {
       setSubmitting(false);
     }
   };
+
+  // ========================================
+  // STYLING
+  // ========================================
 
   const isFound = formData.type === "found";
 
@@ -200,6 +396,10 @@ function ReportItem() {
     isFound ? "text-emerald-700" : "text-rose-600"
   }`;
 
+  // ========================================
+  // JSX
+  // ========================================
+
   return (
     <div
       ref={formRef}
@@ -212,12 +412,16 @@ function ReportItem() {
         transition={{ duration: 0.3 }}
         className="w-full min-w-[300px] max-w-md bg-white/95 backdrop-blur-md border border-emerald-900/10 rounded-2xl p-5 sm:p-7 shadow-sm relative z-10 space-y-5"
       >
-        {/* Found / Lost Toggle */}
+        {/* FOUND / LOST TOGGLE */}
+
         <div className="form-element flex bg-[#F4F7F5] p-1 rounded-xl border border-emerald-900/10 relative">
           <button
             type="button"
             onClick={() =>
-              setFormData((prev) => ({ ...prev, type: "found" }))
+              setFormData((prev) => ({
+                ...prev,
+                type: "found",
+              }))
             }
             className={`flex-1 py-2.5 rounded-lg text-xs font-bold uppercase tracking-wider transition-all duration-300 flex items-center justify-center gap-1.5 relative z-10 ${
               isFound
@@ -232,7 +436,10 @@ function ReportItem() {
           <button
             type="button"
             onClick={() =>
-              setFormData((prev) => ({ ...prev, type: "lost" }))
+              setFormData((prev) => ({
+                ...prev,
+                type: "lost",
+              }))
             }
             className={`flex-1 py-2.5 rounded-lg text-xs font-bold uppercase tracking-wider transition-all duration-300 flex items-center justify-center gap-1.5 relative z-10 ${
               !isFound
@@ -259,7 +466,8 @@ function ReportItem() {
           />
         </div>
 
-        {/* Header */}
+        {/* HEADER */}
+
         <div className="form-element text-center space-y-1.5">
           <AnimatePresence mode="wait">
             <motion.div
@@ -271,8 +479,16 @@ function ReportItem() {
             >
               <h1 className="text-2xl sm:text-[26px] font-extrabold text-emerald-950 tracking-tight">
                 Report{" "}
-                <span className={isFound ? "text-emerald-700" : "text-rose-600"}>
-                  {isFound ? "Found Item" : "Missing Item"}
+                <span
+                  className={
+                    isFound
+                      ? "text-emerald-700"
+                      : "text-rose-600"
+                  }
+                >
+                  {isFound
+                    ? "Found Item"
+                    : "Missing Item"}
                 </span>
               </h1>
 
@@ -284,13 +500,25 @@ function ReportItem() {
             </motion.div>
           </AnimatePresence>
 
-          {/* AI Scanning Status */}
+          {/* SCANNER STATUS */}
+
           <AnimatePresence>
             {scanningImage && (
               <motion.div
-                initial={{ opacity: 0, scale: 0.9, y: 5 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.9 }}
+                initial={{
+                  opacity: 0,
+                  scale: 0.9,
+                  y: 5,
+                }}
+                animate={{
+                  opacity: 1,
+                  scale: 1,
+                  y: 0,
+                }}
+                exit={{
+                  opacity: 0,
+                  scale: 0.9,
+                }}
                 className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 bg-emerald-100 text-emerald-900 rounded-full text-[10px] font-bold mt-2 border border-emerald-300"
               >
                 <Loader2 className="w-3 h-3 animate-spin text-emerald-700" />
@@ -300,9 +528,14 @@ function ReportItem() {
           </AnimatePresence>
         </div>
 
-        {/* Form */}
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {/* Item Name & Location */}
+        {/* FORM */}
+
+        <form
+          onSubmit={handleSubmit}
+          className="space-y-4"
+        >
+          {/* ITEM NAME AND LOCATION */}
+
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="form-element space-y-1.5">
               <label className={labelClass}>
@@ -317,7 +550,9 @@ function ReportItem() {
                 required
                 value={formData.title}
                 onChange={handleChange}
-                placeholder={isFound ? "e.g. Keys" : "e.g. Wallet"}
+                placeholder={
+                  isFound ? "e.g. Keys" : "e.g. Wallet"
+                }
                 className={inputClass}
               />
             </div>
@@ -341,7 +576,8 @@ function ReportItem() {
             </div>
           </div>
 
-          {/* Category & Date */}
+          {/* CATEGORY AND DATE */}
+
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="form-element space-y-1.5">
               <label className={labelClass}>
@@ -355,11 +591,24 @@ function ReportItem() {
                 onChange={handleChange}
                 className={`${inputClass} cursor-pointer`}
               >
-                <option value="Electronics">Electronics</option>
-                <option value="Documents">Documents</option>
+                <option value="Electronics">
+                  Electronics
+                </option>
+
+                <option value="Documents">
+                  Documents
+                </option>
+
                 <option value="Keys">Keys</option>
-                <option value="Clothing">Clothing</option>
-                <option value="Jewelry">Jewelry</option>
+
+                <option value="Clothing">
+                  Clothing
+                </option>
+
+                <option value="Jewelry">
+                  Jewelry
+                </option>
+
                 <option value="Others">Others</option>
               </select>
             </div>
@@ -381,7 +630,8 @@ function ReportItem() {
             </div>
           </div>
 
-          {/* Contact & Upload */}
+          {/* CONTACT AND IMAGE UPLOAD */}
+
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="form-element space-y-1.5">
               <label className={labelClass}>
@@ -410,13 +660,17 @@ function ReportItem() {
               <div className="relative">
                 <input
                   type="file"
-                  accept="image/*"
+                  accept="image/jpeg,image/png,image/webp"
                   onChange={handleFileChange}
                   className="absolute inset-0 w-full h-full opacity-0 z-20 cursor-pointer"
                 />
 
                 <motion.div
-                  whileHover={{ borderColor: isFound ? "#047857" : "#e11d48" }}
+                  whileHover={{
+                    borderColor: isFound
+                      ? "#047857"
+                      : "#e11d48",
+                  }}
                   className={`w-full h-10 flex items-center justify-center gap-1.5 bg-[#F4F7F5] border border-dashed border-emerald-900/20 rounded-lg px-3 text-xs text-emerald-900/60 transition text-center relative z-10 ${
                     isFound
                       ? "hover:bg-emerald-50/50"
@@ -426,10 +680,13 @@ function ReportItem() {
                   {imageFile ? (
                     <div
                       className={`flex items-center gap-1 font-bold truncate ${
-                        isFound ? "text-emerald-700" : "text-rose-600"
+                        isFound
+                          ? "text-emerald-700"
+                          : "text-rose-600"
                       }`}
                     >
                       <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+
                       <span className="truncate text-[10px]">
                         {imageFile.name}
                       </span>
@@ -437,6 +694,7 @@ function ReportItem() {
                   ) : (
                     <>
                       <ImageIcon className={iconClass} />
+
                       <span className="text-[10px] font-bold uppercase tracking-wider">
                         Choose Image
                       </span>
@@ -447,7 +705,8 @@ function ReportItem() {
             </div>
           </div>
 
-          {/* Description */}
+          {/* DESCRIPTION */}
+
           <div className="form-element space-y-1.5">
             <label className={labelClass}>
               <FileText className={iconClass} />
@@ -470,13 +729,14 @@ function ReportItem() {
             />
           </div>
 
-          {/* Submit Button */}
+          {/* SUBMIT BUTTON */}
+
           <div className="form-element pt-1">
             <motion.button
               type="submit"
-              disabled={submitting || scanningImage}
+              disabled={submitting}
               whileHover={
-                !submitting && !scanningImage
+                !submitting
                   ? { y: -2, scale: 1.005 }
                   : {}
               }
@@ -497,7 +757,9 @@ function ReportItem() {
               <span>
                 {submitting
                   ? "Uploading..."
-                  : `Submit ${isFound ? "Found" : "Lost"} Report`}
+                  : `Submit ${
+                      isFound ? "Found" : "Lost"
+                    } Report`}
               </span>
             </motion.button>
           </div>
