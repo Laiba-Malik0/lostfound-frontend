@@ -150,7 +150,6 @@ function Navbar({ notificationCount = 0 }) {
               >
                 <LayoutDashboard className="w-4 h-4 shrink-0 text-white" />
                 <span className="flex items-center justify-center gap-2 text-white">
-  <LayoutDashboard className="w-4 h-4 shrink-0" />
   My Dashboard
 </span>
               </Link>
